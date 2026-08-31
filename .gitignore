@@ -1,0 +1,7 @@
+build/
+weights/
+tests/golden/
+__pycache__/
+*.pyc
+.DS_Store
+.claude
