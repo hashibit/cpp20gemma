@@ -1,40 +1,40 @@
-# 从零开始学写推理引擎
+# Learn to Build an Inference Engine from Scratch
 
-这是一套完全面向 0 基础读者的学习文章，围绕本仓库的 C++20 推理引擎展开。
-每一篇都遵循同样的结构：**为什么需要它 → 核心概念从零讲起 → 手算例子 → 我们的真实代码 → 踩过的坑**。
+This is a tutorial series written for complete beginners, built around this repository's C++20 inference engine.
+Every article follows the same structure: **why you need it → the core concept from zero → a worked example by hand → our real code → pitfalls we hit**.
 
-学习它最好的方式：一边读文章，一边打开对应的源码文件，跑 `make test` 验证你的理解，然后动手改代码看测试会不会红。
+The best way to learn: read an article with the corresponding source file open, run `make test` to check your understanding, then change the code and watch the tests fail.
 
-## 学习路线（按依赖顺序阅读）
+## Reading path (in dependency order)
 
-| # | 文章 | 对应源码 | 一句话 |
+| # | Article | Source | In one sentence |
 |---|---|---|---|
-| 00 | [总览：一个推理引擎在做什么](00-总览.md) | `src/main.cpp` | 全流程地图，先看整体 |
-| 01 | [Tokenizer：文字怎么变成数字](01-Tokenizer.md) | `src/tokenizer.cpp` | 模型只认识数字 |
-| 02 | [二进制格式设计：权重文件长什么样](02-二进制格式.md) | `src/weights.cpp` `py/common.py` | 定长头 + 固定顺序 = 零成本校验 |
-| 03 | [嵌入与位置编码](03-嵌入与位置编码.md) | `src/model.cpp` | 词向量查表 + 位置偏置 |
-| 04 | [RMSNorm：让数值不爆炸](04-RMSNorm.md) | `src/ops.cpp` | 一行公式的归一化 |
-| 05 | [RoPE：旋转位置编码](05-RoPE.md) | `src/ops.cpp` | 用旋转把位置写进向量 |
-| 06 | [注意力机制：模型怎么"看"上下文](06-注意力.md) | `src/model.cpp` | Q/K/V、softmax、因果 |
-| 07 | [KV Cache 与 GQA：解码提速的关键](07-KV-Cache与GQA.md) | `src/kv_cache.h` | 别重复算历史 |
-| 08 | [MLP 与 GeGLU：每个词独立加工](08-MLP与GeGLU.md) | `src/model.cpp` | 注意力交换信息，MLP 独立加工 |
-| 09 | [INT8 量化：把 1GB 压缩到 250MB](09-INT8量化.md) | `py/common.py` `src/kernel.cpp` | 省内存的原理 |
-| 10 | [SIMD 与矩阵乘法：为什么能快](10-SIMD与矩阵乘法.md) | `src/kernel.cpp` | 一条指令算 8 个数 |
-| 11 | [采样策略：模型怎么"选词"](11-采样.md) | `src/sampler.cpp` | 贪心、温度、Min-P |
-| 12 | [测试策略：怎么证明算对了](12-测试策略.md) | `tests/` `py/generate_golden.py` | NumPy 参考 + 容差 + 真实 bug 回顾 |
+| 00 | [Overview: what an inference engine does](00-Overview.md) | `src/main.cpp` | The full-pipeline map; see the big picture first |
+| 01 | [Tokenizer: how text becomes numbers](01-Tokenizer.md) | `src/tokenizer.cpp` | The model only knows numbers |
+| 02 | [Binary format design: what a weights file looks like](02-Binary-Format.md) | `src/weights.cpp` `py/common.py` | Fixed header + fixed order = zero-cost validation |
+| 03 | [Embeddings and positional encoding](03-Embeddings-and-Positional-Encoding.md) | `src/model.cpp` | Vector lookup + position bias |
+| 04 | [RMSNorm: keeping the numbers from exploding](04-RMSNorm.md) | `src/ops.cpp` | Normalization in a one-line formula |
+| 05 | [RoPE: rotary position embedding](05-RoPE.md) | `src/ops.cpp` | Encoding position into vectors via rotation |
+| 06 | [Attention: how the model "reads" context](06-Attention.md) | `src/model.cpp` | Q/K/V, softmax, causality |
+| 07 | [KV cache and GQA: the key to fast decoding](07-KV-Cache-and-GQA.md) | `src/kv_cache.h` | Never recompute history |
+| 08 | [MLP and GeGLU: processing each word independently](08-MLP-and-GeGLU.md) | `src/model.cpp` | Attention exchanges information; the MLP processes it |
+| 09 | [INT8 quantization: compressing 1 GB into 250 MB](09-INT8-Quantization.md) | `py/common.py` `src/kernel.cpp` | How the memory savings work |
+| 10 | [SIMD and matrix multiplication: why it's fast](10-SIMD-and-Matrix-Multiplication.md) | `src/kernel.cpp` | One instruction computes 8 numbers |
+| 11 | [Sampling: how the model "picks words"](11-Sampling.md) | `src/sampler.cpp` | Greedy, temperature, Min-P |
+| 12 | [Testing strategy: how to prove the math is right](12-Testing-Strategy.md) | `tests/` `py/generate_golden.py` | NumPy reference + tolerances + real bug retrospectives |
 
-## 建议的动手实验（按顺序做）
+## Suggested hands-on exercises (in order)
 
-1. 读完 00-02 后：跑 `./build/gemma --weights_path weights/tiny_weights.bin --dump`，对照文章看懂每一个字段
-2. 读完 03-08 后：跑 `make test`，然后故意改错一个地方（比如把 `attention_block` 里的 `kvh = h * nkv / nh` 改成 `0`），看测试怎么红、错误从哪一层冒出来
-3. 读完 09-11 后：改 `py/make_test_weights.py` 里的温度/采样参数，观察输出变化；把 `--minp` 去掉对比贪心输出
-4. 读完 12 后：给一个新算子（比如 GELU 替代 SiLU）写 golden 测试——这是检验你是否真正掌握的方式
+1. After 00–02: run `./build/gemma --weights_path weights/tiny_weights.bin --dump` and match every field against the articles
+2. After 03–08: run `make test`, then deliberately break something (e.g. change `kvh = h * nkv / nh` inside `attention_block` to `0`) and watch how the tests fail and from which layer the error surfaces
+3. After 09–11: change the temperature/sampling parameters in `py/make_test_weights.py` and observe the output; drop `--minp` and compare against the greedy output
+4. After 12: write a golden test for a new operator (e.g. GELU instead of SiLU) — this is the real test of whether you've mastered it
 
-## 前置知识
+## Prerequisites
 
-只需要：会一门编程语言（任意），知道函数和数组是什么。浮点数、SIMD、矩阵都会在文章里从零讲。
+Only this: one programming language (any), and knowing what functions and arrays are. Floating point, SIMD, and matrices are all taught from zero in the articles.
 
-## 本引擎的定位（诚实声明）
+## What this engine is (honest disclaimer)
 
-本引擎实现的是**教学用简化架构**，不是位精确的真实 Gemma 3n。
-教学上它足够完整：量化、SIMD、GQA、RoPE、KV Cache、采样、逐层测试——一个推理引擎该有的零件全都有，且总共只有约 1500 行 C++，是你能通读的规模。
+This engine implements a **simplified teaching architecture**, not bit-exact real Gemma 3n.
+As teaching material it is complete enough: quantization, SIMD, GQA, RoPE, KV cache, sampling, per-layer tests — every part an inference engine needs, in roughly 1500 lines of C++, which is a size you can actually read through.

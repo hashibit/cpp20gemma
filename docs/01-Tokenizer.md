@@ -1,66 +1,66 @@
-# 01 · Tokenizer：文字怎么变成数字
+# 01 · Tokenizer: How Text Becomes Numbers
 
-> 读完这篇你会知道：为什么模型只认数字、token 和词表是什么、最长前缀匹配算法怎么工作、byte fallback 为什么是不可或缺的兜底。
-> 对应源码：`src/tokenizer.h` `src/tokenizer.cpp`、`py/make_test_weights.py`（生成测试词表）、`py/reference_model.py` 的 `TokenizerRef`（Python 对应实现）。
+> By the end of this article you will know: why the model only understands numbers, what tokens and a vocabulary are, how the longest-prefix-match algorithm works, and why byte fallback is an indispensable safety net.
+> Corresponding source: `src/tokenizer.h` `src/tokenizer.cpp`, `py/make_test_weights.py` (generates the test vocabulary), `TokenizerRef` in `py/reference_model.py` (the Python counterpart).
 
-## 一、为什么模型不能直接读文字？
+## 1. Why can't the model read text directly?
 
-计算机里文字就是一串字节，比如 `"The"` 是三个字节 `0x54 0x68 0x65`。技术上模型当然可以吃字节，但效果很差：一个字节只有 256 种可能，几乎不携带任何语义——"t" 和 "h" 单独看毫无意义，"th" 合起来才开始有意义。
+In a computer, text is just a sequence of bytes — `"The"` is the three bytes `0x54 0x68 0x65`. Technically the model could eat raw bytes, but the results are poor: a byte has only 256 possibilities and carries almost no semantics — "t" and "h" mean nothing on their own; "th" is where meaning starts to appear.
 
-所以大模型的做法是：准备一本**词典（词表，vocab）**，把常见的"词块"编号：
+So large models do this instead: prepare a **dictionary (the vocabulary, or vocab)** that assigns a number to common "chunks of words":
 
 ```
-词表（我们测试模型的 1024 个词条，节选）：
+Vocabulary (excerpt from our test model's 1024 entries):
 id 6     → "The"
 id 10    → "of"
 id 89    → "life"
 id 112   → "meaning"
-id 289   → " "（空格也可以是一个词条！）
-id 768   → 字节 0x00   ← 第 768~1023 号是 256 个"字节词条"
-id 800   → 字节 0x20（空格）
+id 289   → " "  (even a space can be an entry!)
+id 768   → byte 0x00   ← ids 768–1023 are the 256 "byte entries"
+id 800   → byte 0x20 (space)
 ...
-id 0~5   → "<pad>" "<eos>" "<bos>" "<unk>" "<start_of_turn>" "<end_of_turn>"（控制词条）
+id 0–5   → "<pad>" "<eos>" "<bos>" "<unk>" "<start_of_turn>" "<end_of_turn>" (control entries)
 ```
 
-每个词条叫一个 **token**。把文字切成 token 序列的过程叫 **tokenize**，反向过程叫 **detokenize**：
+Each entry is a **token**. Splitting text into a token sequence is called **tokenizing**; the reverse is **detokenizing**:
 
 ```
 "The meaning of life"  →  [6, 289, 112, 289, 10, 289, 89]
 ```
 
-> 真实大模型的词表大得多：GPT 系列几万到十几万，Gemma 3n 有 26 万个词条。词条也不是"单词"，而是更细的**子词（subword）**：比如 "learning" 可能被切成 "learn" + "ing" 两个 token。子词的好处是生僻词也能拼出来。我们的测试模型同时混用了单词和字节词条，原理相通。
+> Real models have much bigger vocabularies: the GPT family has tens to hundreds of thousands of entries; Gemma 3n has 262K. Entries are not "words" either, but finer-grained **subwords**: "learning" might be split into "learn" + "ing". Subwords let the model spell out rare words it has never seen. Our test model mixes whole words and byte entries, but the principle is the same.
 
-## 二、编码算法：最长前缀匹配（greedy longest-prefix match）
+## 2. The encoding algorithm: greedy longest-prefix matching
 
-给定文字，怎么查词典切分？一个朴素的想法是"从左到右，每次取词典里最长的能匹配上的前缀"。这就是**贪心最长前缀匹配**。
+Given text, how do we slice it using the dictionary? The naive idea is "left to right, at each step take the longest prefix that matches a dictionary entry". That is **greedy longest-prefix matching**.
 
-拿 `"The meaning"` 举例（假设词表里有 "The"、" "、"meaning"、"Th"、"The m" 这些词条）：
+Take `"The meaning"` as an example (assume the vocab contains "The", " ", "meaning", "Th", "The m"):
 
 ```
-位置 0："The meaning..." 从最长可能长度开始试探
-  试 "The mea" → 不在词表
-  试 "The me"  → 不在词表
-  试 "The m"   → 在！id 假设为 500
-  ✗ 注意：这样 "The m" 会把 "The" 和空格一起匹配掉。
+Position 0: "The meaning..." — try from the longest possible length
+  Try "The mea" → not in the vocab
+  Try "The me"  → not in the vocab
+  Try "The m"   → match! assume id 500
+  ✗ Note: "The m" swallows "The" and the space together.
 ```
 
-整个算法的流程：
+The full algorithm:
 
 ```mermaid
 flowchart TD
-    I["位置 i = 0"] --> C{"i < 文本长度？"}
-    C -->|"否"| OUT["输出 token 序列"]
-    C -->|"是"| L["L = 最长词条长度（封顶剩余长度）"]
-    L --> M{"text[i..i+L)<br/>在词表里吗？"}
-    M -->|"是"| P["记录该 id，i += L"] --> C
-    M -->|"否"| N{"L == 0？"}
-    N -->|"否"| L2["L -= 1，继续试探"] --> M
-    N -->|"是"| B["字节兜底：查 byte_token，i += 1"] --> C
+    I["position i = 0"] --> C{"i < text length?"}
+    C -->|"no"| OUT["output the token sequence"]
+    C -->|"yes"| L["L = longest entry length (capped by remaining length)"]
+    L --> M{"is text[i..i+L)<br/>in the vocab?"}
+    M -->|"yes"| P["record that id, i += L"] --> C
+    M -->|"no"| N{"L == 0?"}
+    N -->|"no"| L2["L -= 1, keep trying"] --> M
+    N -->|"yes"| B["byte fallback: look up byte_token, i += 1"] --> C
 ```
 
-所以"最长匹配"有个关键性质：**先到先得，匹配后不再回溯**（贪心）。`"The m"` 更长，就选中它，从位置 5 继续。这是标准做法，好处是算法简单、O(n) 复杂度；坏处是局部最优，未必是全局最优切分——但对大模型来说完全够用。
+So "longest match" has a key property: **first come, first served — once a match is made there is no backtracking** (greedy). `"The m"` is longer, so it wins and we continue from position 5. This is the standard approach: the algorithm is simple and O(n). The downside is that it's locally optimal and not necessarily the globally best segmentation — but for large models that's perfectly fine.
 
-我们的实现（`src/tokenizer.cpp` 的 `encode`）：
+Our implementation (`encode` in `src/tokenizer.cpp`):
 
 ```cpp
 std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
@@ -69,16 +69,16 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
     while (i < text.size()) {
         size_t L = max_piece_len < text.size() - i ? max_piece_len : text.size() - i;
         bool matched = false;
-        for (; L > 0; L--) {                       // 从最长试探到最短
+        for (; L > 0; L--) {                       // try from longest to shortest
             auto it = piece_to_id.find(std::string_view(text.data() + i, L));
-            if (it != piece_to_id.end()) {         // 命中！
+            if (it != piece_to_id.end()) {         // hit!
                 ids.push_back(it->second);
-                i += L;                            // 消耗 L 个字节，继续
+                i += L;                            // consume L bytes, continue
                 matched = true;
                 break;
             }
         }
-        if (!matched) {                            // 一个都没匹配上 → 字节兜底
+        if (!matched) {                            // nothing matched → byte fallback
             uint32_t bt = byte_token[(uint8_t)text[i]];
             ids.push_back(bt == UINT32_MAX ? unk_id : bt);
             i += 1;
@@ -88,81 +88,81 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
 }
 ```
 
-其中 `piece_to_id` 是一个哈希表（`unordered_map<string_view, uint32_t>`）：词条文本 → 编号。查找平均 O(1)，所以整个编码是 O(n × 最长词条长度)。
+`piece_to_id` is a hash table (`unordered_map<string_view, uint32_t>`): entry text → id. Lookup is O(1) on average, so the whole encoding is O(n × longest entry length).
 
-## 三、Byte fallback：为什么词典里要塞 256 个"字节词条"？
+## 3. Byte fallback: why does the dictionary carry 256 "byte entries"?
 
-试想用户输入了一个词典里没有的字："世界"。词典里没有这个词条，也没有 "世" 或 "界"。如果只靠词条匹配，只能输出 `<unk>`（未知），**信息就丢了**——模型根本不知道用户说了什么。
+Imagine a user types a character that isn't in the dictionary: "世界". There is no entry for it, nor for "世" or "界". Relying on entry matching alone, the only output would be `<unk>` (unknown) — and **the information is lost**: the model has no idea what the user said.
 
-解法：词典里**永远保证有 256 个特殊词条，分别代表单个字节 0x00~0xFF**。任何文字都是字节序列，所以：
+The fix: the dictionary **always guarantees 256 special entries, one for each byte 0x00–0xFF**. Any text is a byte sequence, so:
 
 ```
-"世界" 的 UTF-8 编码是 6 个字节 E4 B8 96 E7 95 8C
-每个字节单独查表：E4 → id 996, B8 → id 952, ...
+The UTF-8 encoding of "世界" is 6 bytes: E4 B8 96 E7 95 8C
+Each byte is looked up individually: E4 → id 996, B8 → id 952, ...
 ```
 
-**任何输入都能被编码，任何编码都能还原成原文**。这个性质叫"往返无损"（roundtrip），是词表设计的一条铁律。我们的测试就专门验证了它（`tests/unit_tests.cpp` 的 `tokenizer_test`）：
+**Any input can be encoded, and any encoding can be restored to the original text.** This property is called a lossless "round-trip", and it's an iron rule of vocabulary design. Our tests verify it explicitly (`tokenizer_test` in `tests/unit_tests.cpp`):
 
 ```cpp
-// 中文往返测试："hello 世界 test" 编码后再解码，必须逐字节相等
+// Chinese round-trip test: "hello 世界 test" encoded then decoded must be byte-for-byte identical
 const std::string s2 = "hello \xe4\xb8\x96\xe7\x95\x8c test";
 CHECK(tok.decode(tok.encode(s2)) == s2);
-// 最极端的测试：256 个原始字节全部走一遍
+// The most extreme test: all 256 raw bytes, one at a time
 std::string s3;
 for (int i = 0; i < 256; i++) s3 += (char)i;
 CHECK(tok.decode(tok.encode(s3)) == s3);
 ```
 
-真实 Gemma 的词表里这 256 个字节词条写作 `<0x00>` 到 `<0xFF>`，转换脚本（`py/convert_tokenizer.py`）会把它们还原成真实字节。
+In real Gemma's vocabulary these 256 byte entries are written `<0x00>` through `<0xFF>`; the conversion script (`py/convert_tokenizer.py`) turns them back into real bytes.
 
-## 四、解码：数字 → 文字
+## 4. Decoding: numbers → text
 
-`decode_id` 按词条类型区别对待（`src/tokenizer.cpp`）：
+`decode_id` treats entry types differently (`src/tokenizer.cpp`):
 
 ```cpp
 std::string Tokenizer::decode_id(uint32_t id) const {
     if (id >= entries.size()) return "";
     const Entry& e = entries[id];
-    if (e.type == fmt::kControl) return "";   // 控制词条不产生文字
-    return std::string(e.piece);              // 普通词条/字节词条直接拼接
+    if (e.type == fmt::kControl) return "";   // control entries produce no text
+    return std::string(e.piece);              // normal/byte entries are concatenated
 }
 ```
 
-三种词条类型（`src/config.h` 的 `fmt::TokenType`）：
+The three entry types (`fmt::TokenType` in `src/config.h`):
 
-| 类型 | 含义 | 解码行为 | 例子 |
+| Type | Meaning | Decode behavior | Example |
 |---|---|---|---|
-| 0 普通 | 单词/子词 | 拼接其文本 | "The" |
-| 1 字节 | 单个原始字节 | 拼接该字节 | 0xE4 |
-| 2 控制 | 特殊标记 | **跳过，不输出** | `<eos>` `<start_of_turn>` |
+| 0 normal | word/subword | concatenate its text | "The" |
+| 1 byte | a single raw byte | concatenate that byte | 0xE4 |
+| 2 control | special marker | **skipped, not output** | `<eos>` `<start_of_turn>` |
 
-控制词条控制着生成流程但不进入正文：生成循环遇到 `<eos>`（结束符）就停止（这就是 `--terminate_on_eos` 的实现），对话模板里的 `<start_of_turn>` 用来标记"轮到模型说话了"。
+Control entries steer the generation flow but never enter the text: the generation loop stops when it hits `<eos>` (that's what `--terminate_on_eos` implements), and `<start_of_turn>` in the chat template marks "it's the model's turn to speak".
 
-## 五、二进制格式：词表文件长什么样
+## 5. Binary format: what does the vocabulary file look like?
 
-C++ 引擎不想依赖 Python 的 protobuf 库去解析 HuggingFace 的词表文件（sentencepiece 是 protobuf 格式），所以我们定义了自己的格式 **GMT1**（`src/config.h` 的 `fmt::TokenizerHeader`）：
+We didn't want the C++ engine to depend on Python's protobuf library to parse HuggingFace vocabulary files (sentencepiece is a protobuf format), so we defined our own format, **GMT1** (`fmt::TokenizerHeader` in `src/config.h`):
 
-| 偏移 | 大小 | 字段 | 说明 |
+| Offset | Size | Field | Meaning |
 |---|---|---|---|
-| 0 | 4 | magic = "GMT1" | 识别"这是我的格式" |
-| 4 | 4 | version = 1 | 格式版本号 |
-| 8 | 4 | vocab_size = 1024 | 词条数 |
-| 12 | 4 | bos_id | 句首标记的编号 |
-| 16 | 4 | eos_id | 句尾标记的编号 |
-| 20 | 4 | unk_id | 未知标记 |
-| 24 | 4 | pad_id | 填充标记 |
-| 28 | 20 | reserved | 保留，必须全 0 |
-| — | — | — | **以上 48 字节是定长头** — |
-| 48 | 动态 | vocab_size 条记录 | 每条：u32 len（文本字节长度）+ u32 type（0 普通 / 1 字节 / 2 控制）+ f32 score（词频分数，真实 SentencePiece 有，我们暂不用）+ len 字节 UTF-8 文本 |
+| 0 | 4 | magic = "GMT1" | identifies "this is my format" |
+| 4 | 4 | version = 1 | format version |
+| 8 | 4 | vocab_size = 1024 | number of entries |
+| 12 | 4 | bos_id | id of the beginning-of-sequence marker |
+| 16 | 4 | eos_id | id of the end-of-sequence marker |
+| 20 | 4 | unk_id | unknown marker |
+| 24 | 4 | pad_id | padding marker |
+| 28 | 20 | reserved | reserved, must be all 0 |
+| — | — | — | **the above 48 bytes are the fixed header** — |
+| 48 | dynamic | vocab_size records | each: u32 len (text length in bytes) + u32 type (0 normal / 1 byte / 2 control) + f32 score (frequency score; real SentencePiece has it, we don't use it yet) + len bytes of UTF-8 text |
 
-**格式设计的第一原则**：读文件不靠猜，靠校验。magic 对不上 → 报错；version 对不上 → 报错；reserved 非零 → 报错。任何"读错文件/文件损坏"都会立刻暴露，而不是悄悄产出垃圾结果。（权重格式把这条原则发挥得更彻底，见《02-二进制格式》。）
+**The first principle of format design**: don't read files by guessing — validate. Magic mismatch → error; version mismatch → error; reserved non-zero → error. Any "wrong file / corrupted file" surfaces immediately instead of quietly producing garbage. (The weights format takes this principle even further — see [02 - Binary Format](02-Binary-Format.md).)
 
-## 六、加载词表时的两个细节
+## 6. Two details of loading the vocabulary
 
-看 `Tokenizer::load`（`src/tokenizer.cpp`）：
+Look at `Tokenizer::load` (`src/tokenizer.cpp`):
 
 ```cpp
-blob.reserve(blob_len);          // 1. 先算好总长，预留空间
+blob.reserve(blob_len);          // 1. compute the total length up front, reserve
 for (uint32_t i = 0; i < h.vocab_size; i++) {
     ...
     size_t at = blob.size();
@@ -175,43 +175,43 @@ for (uint32_t i = 0; i < h.vocab_size; i++) {
 }
 ```
 
-- **`string_view` 指向 `blob` 内部**：所有词条文本拼进一个大字符串，哈希表的 key 只是指向它的"窗口"，不复制文本。`reserve(blob_len)` 保证 append 期间不重新分配内存——否则重分配会让之前存的指针全部失效（这是 C++ 里经典的"迭代器失效"问题在指针上的翻版）。
-- **重复词条检测**：同样的文本出现两次，编码结果就模棱两可。
+- **`string_view` points into `blob`**: all entry texts are concatenated into one big string, and the hash table's keys are just "windows" into it — no text is copied. `reserve(blob_len)` guarantees no reallocation during the appends — otherwise a reallocation would invalidate every pointer stored so far (the classic C++ "iterator invalidation" problem, wearing a pointer costume).
+- **Duplicate entry detection**: if the same text appears twice, encoding becomes ambiguous.
 
-## 七、我们踩过的真实 bug：重复词条
+## 7. A real bug we hit: duplicate entries
 
-这是开发时真实发生的故事，非常有教学价值。第一版测试词表里同时有：
+This is a true story from development, with real teaching value. The first version of the test vocabulary contained both:
 
-- id 289：词条 `" "`（空格，作为普通单词）
-- id 800：词条字节 0x20（空格，作为字节兜底）
+- id 289: entry `" "` (a space, as a normal word)
+- id 800: entry byte 0x20 (a space, as the byte fallback)
 
-两个词条文本相同！于是：
+Two entries with identical text! So:
 
-- **C++** 的哈希表用 `emplace`：重复键插入失败，**保留第一个** → `" "` 编码成 289
-- **Python 参考**用字典推导式：重复键**后写的覆盖** → `" "` 编码成 800
+- **C++** uses `emplace` on its hash table: duplicate insert fails, **the first one stays** → `" "` encodes to 289
+- The **Python reference** builds its dict with a comprehension: duplicate keys, **the last write wins** → `" "` encodes to 800
 
-| | C++ 加载器 | Python 参考 |
+| | C++ loader | Python reference |
 |---|---|---|
-| 数据结构 | unordered_map + emplace | 字典推导式 |
-| 重复键语义 | 插入失败，保留**第一个** | **后写覆盖** |
-| 结果 | `" "` → 289 | `" "` → 800 |
+| Data structure | unordered_map + emplace | dict comprehension |
+| Duplicate-key semantics | insert fails, keeps the **first** | **last write wins** |
+| Result | `" "` → 289 | `" "` → 800 |
 
-结果：C++ 引擎和 Python 参考把同一个 prompt 编码成了不同的 token 序列，两边模型状态从第 2 个 token 起就不一致了。集成测试里表现为 token 序列对不上——**但不是全部对不上**（因为 logits 对比的细节掩盖了问题），排查花了不少时间。
+Result: the C++ engine and the Python reference encoded the same prompt into different token sequences, and the two models' states diverged from the 2nd token onward. In the integration test this showed up as token sequences that didn't match — **but not entirely** (a detail in the logits comparison masked the problem), and the investigation took a while.
 
-修复（`py/make_test_weights.py`）：生成词表时**剔除所有单字节的单词词条**——每个字节已经有字节词条了，单字节单词词条必然是重复。另外两侧加载器都加上了重复检测（C++ 警告、Python 直接报错）。
+Fix (`py/make_test_weights.py`): when generating the vocabulary, **exclude all single-byte word entries** — every byte already has a byte entry, so a single-byte word entry is guaranteed to be a duplicate. In addition, both loaders got duplicate detection (a warning in C++, a hard error in Python).
 
-**教训**：任何"键"系统（词表、字典、映射表），先问一句"键允许重复吗？重复时谁赢？"两端实现必须给出相同答案。
+**Lesson**: for any "keyed" system (vocab, dict, mapping table), ask up front: "are duplicate keys allowed, and when they happen, who wins?" Both implementations must give the same answer.
 
-## 八、总结
+## 8. Summary
 
-1. Tokenizer = 词典 + 查表。编码用贪心最长前缀匹配，O(n)
-2. 词典必须含 256 个字节词条 → 任何输入可编码、可无损还原（roundtrip）
-3. 控制词条不产生文字，但驱动流程（`<eos>` 停止、`<start_of_turn>` 对话轮次）
-4. 自定义二进制格式 = 定长头（magic/version/控制id）+ 变长记录，加载时全字段校验
-5. 词表键必须唯一，且 C++/Python 两侧对重复键的处理语义必须一致
+1. Tokenizer = dictionary + lookup. Encoding uses greedy longest-prefix matching, O(n)
+2. The dictionary must contain 256 byte entries → any input can be encoded and restored losslessly (round-trip)
+3. Control entries produce no text but drive the flow (`<eos>` stops generation; `<start_of_turn>` marks chat turns)
+4. Custom binary format = fixed header (magic/version/control ids) + variable-length records, with every field validated on load
+5. Vocabulary keys must be unique, and the C++/Python sides must agree on duplicate-key semantics
 
-## 思考题
+## Exercises
 
-1. `max_piece_len` 是词表里最长词条的字节数。如果把它设成 1，编码结果会变成什么样？
-2. 为什么 `<start_of_turn>` 这类控制词条要放在词表里，而不是像换行符一样硬编码在 C++ 代码里？（提示：不同模型的控制词条文本可能不同）
-3. 编码 `"hello 世界"` 时，中文部分会走字节兜底。如果词典里加一个词条 `"世界"`，编码结果会变短吗？为什么？（提示：最长匹配优先）
+1. `max_piece_len` is the byte length of the longest entry in the vocabulary. If you set it to 1, what does the encoding output look like?
+2. Why do control entries like `<start_of_turn>` live in the vocabulary instead of being hard-coded in C++ like a newline? (Hint: different models may use different control-entry text)
+3. When encoding `"hello 世界"`, the Chinese part goes through byte fallback. If we added an entry `"世界"` to the dictionary, would the encoding get shorter? Why? (Hint: longest match wins)

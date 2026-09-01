@@ -1,109 +1,109 @@
-# 05 · RoPE：旋转位置编码
+# 05 · RoPE: Rotary Position Embedding
 
-> 读完这篇你会知道：位置编码的三代演进、为什么"旋转"能携带位置信息、固定公式为什么没学过也能行、GPT-NeoX 交错排列是什么、cos/sin 表为什么惰性生成、以及一个让我们调试半天的经典原地别名 bug。
-> 对应源码：`src/ops.cpp` 的 `RopeCache`、`py/reference_model.py` 的 `rope_apply`。
+> By the end of this article you will know: the three generations of positional encoding, why "rotation" carries position information, why a fixed formula works without ever being trained, what GPT-NeoX interleaved pairing is, why the cos/sin tables are generated lazily — and a classic in-place aliasing bug that cost us half a day of debugging.
+> Corresponding source: `RopeCache` in `src/ops.cpp`, `rope_apply` in `py/reference_model.py`.
 
-## 一、位置编码的演进（三代）
+## 1. The evolution of positional encoding (three generations)
 
-《03-嵌入与位置编码》讲了第一代：给每个绝对位置分配一个可学习向量，加到词向量上。它的问题：位置表有长度上限（我们的 256 行），超出就无法表示；而且位置 100 和位置 101 的相对关系，模型只能从数据里自行学习。
+[03 - Embeddings and Positional Encoding](03-Embeddings-and-Positional-Encoding.md) covered generation one: give every absolute position a learnable vector and add it to the word vector. Its problems: the position table has a length cap (ours is 256 rows) and cannot represent anything beyond it; and the relative relationship between position 100 and 101 has to be learned from data by the model itself.
 
-第二代（Transformer 原版论文）：用固定的正弦函数 `sin(pos / 10000^(i/d))` 生成位置向量，不学习。好处是不用存表、可外推。但它是绝对编码，词与词之间的**相对距离**仍然要靠模型自己推断。
+Generation two (the original Transformer paper): fixed sinusoidal functions `sin(pos / 10000^(i/d))` generate the position vectors — nothing is learned. No table to store, and it extrapolates. But it's still absolute encoding; the **relative distance** between words still has to be inferred by the model.
 
-第三代（2021 年提出，现代主流）：**RoPE（Rotary Position Embedding，旋转位置编码）**。核心洞察是——
+Generation three (proposed in 2021, modern mainstream): **RoPE (Rotary Position Embedding)**. The core insight —
 
-> 与其给每个位置一个"地址牌"，不如把位置信息藏在向量本身：**两个向量的点积结果，直接由它们的相对位置差 Δ 调制**。
+> Rather than handing each position a "name tag", hide the position inside the vectors themselves: **the dot product of two vectors is modulated directly by their relative position difference Δ**.
 
-先解释这几个词：**点积**（内积）是衡量两个向量相似度的运算，两个词越相关，向量的点积越大；**Δ（delta）**是位置差，第 5 位的词和第 2 位的词，Δ = 3。在注意力里（《06-注意力》正式讲），参与点积的两个向量正是 **q 和 k**——query（查询）和 key（钥匙），模型用它们比较任意两个词的相关程度。
+First, the vocabulary: a **dot product** (inner product) measures the similarity of two vectors — the more related two words, the larger the dot product of their vectors. **Δ (delta)** is the position difference: for a word at position 5 and one at position 2, Δ = 3. In attention (formally covered in [06 - Attention](06-Attention.md)), the vectors whose dot product is taken are exactly **q and k** — query and key; the model uses them to compare how related any two words are.
 
-所以 RoPE 的实际效果是：**q、k 做点积时，两词相隔多远（Δ）直接写进结果**。这意味着：位置差 3 的任意两个词，无论出现在句首还是句尾，它们的内积都会被同样地"调制"。这正是相对位置编码的理想性质。
+So RoPE's practical effect: **when q and k take their dot product, how far apart the two words are (Δ) is written directly into the result**. This means any two words with position difference 3, whether at the start of a sentence or the end, get their inner product modulated identically. That is exactly the ideal property of relative position encoding.
 
-三代方案对比：
+The three generations side by side:
 
-| | 第一代：可学习位置向量 | 第二代：固定正弦 | 第三代：RoPE |
+| | Gen 1: learnable position vectors | Gen 2: fixed sinusoidal | Gen 3: RoPE |
 |---|---|---|---|
-| 位置如何表示 | 每个位置一个可学习向量 | sin/cos 公式生成向量 | 旋转 q/k 向量 |
-| 要存表吗 | 要（有长度上限） | 不要 | 不要（cos/sin 惰性生成） |
-| 能否外推 | 否 | 能 | 能 |
-| 相对距离 (p−q) | 不直接编码，靠学 | 不直接编码，靠学 | **直接进 q·k 内积** |
-| 现代模型 | — | 很少 | Gemma / LLaMA |
+| How position is represented | one learnable vector per position | vectors from sin/cos formulas | rotate the q/k vectors |
+| Needs a table? | yes (with a length cap) | no | no (cos/sin generated lazily) |
+| Can extrapolate? | no | yes | yes |
+| Relative distance (p−q) | not encoded directly; must be learned | not encoded directly; must be learned | **goes directly into the q·k inner product** |
+| Modern models | — | rare | Gemma / LLaMA |
 
-### 固定公式没"学过"，怎么能行？
+### How can a fixed formula "work" if it was never trained?
 
-一个高频疑问：可学习位置表好歹是从训练数据里"长"出来的，RoPE 的旋转角度是一串写死的公式——它没有学习过程，岂不是没从数据里学到东西？
+A frequent question: a learnable position table at least "grew" out of training data, while RoPE's rotation angles are a hard-coded formula — no learning process, so didn't it learn nothing from the data?
 
-要回答它，先分清**谁负责提供信息，谁负责学习解读**：
+To answer, first separate **who provides the information** from **who learns to interpret it**:
 
-- **位置编码（无论学来的还是公式算的）只负责"提供位置信息"**——告诉模型"这个 token 在第几个位置"。没有它，注意力对词序不敏感，输入里根本没有位置信号，学无可学
-- **下游整个网络负责"学会使用位置信息"**——q_proj、k_proj、注意力权重、MLP 全部从数据训练出来。训练数据教它们的，是"旋转角度差 3 意味着两个词离得近、关系更紧"，不是"位置 5 的向量是什么"
+- **Positional encoding (learned or formulaic) only "provides position information"** — it tells the model "this token is at position #". Without it, attention is insensitive to word order: the input contains no position signal, so there is nothing to learn
+- **The entire downstream network "learns to use the position information"** — q_proj, k_proj, the attention weights, the MLP are all trained from data. What the data teaches them is "a rotation-angle difference of 3 means the two words are close and related", not "what is the vector of position 5"
 
-所以"RoPE 本身没学过"不假——但它只负责提供信息，真正从数据里学东西的是它下游的整个网络，一样没少。
+So "RoPE itself was never trained" is true — but it only provides information; the entire downstream network learns from data just the same. Nothing is lost.
 
-**硬编码 ≠ 没学习。** 卷积网络里"邻近像素共享权重"的平移结构是硬编码的，RNN 的循环结构是硬编码的，没人说 CNN 没从数据学到东西。架构 = 预先设定的先验（词有顺序、近邻比远亲更相关），权重 = 从数据学习的参数。RoPE 是架构层的结构，与卷积的平移结构同级。
+**Hard-coded ≠ not learned.** In convolutional networks, the translation structure of "neighboring pixels share weights" is hard-coded; an RNN's recurrence is hard-coded; nobody says a CNN learned nothing from data. Architecture = priors fixed in advance (words have order; near neighbors are more relevant than distant ones); weights = parameters learned from data. RoPE is architecture-level structure, on the same tier as convolution's translation structure.
 
-**学来的位置表是"背条目"，不是"学概念"。** 它把 256 个位置各背一个互不相干的向量，位置 5 和位置 6 之间没有任何被强制的关系——所以位置 257 没有条目，只能 clamp。公式则是"推导"：任意位置即时可算，相邻位置的信号结构相连，还自带"相对距离进内积"的性质。**背条目注定不能外推，学概念可以。**
+**A learned position table "memorizes entries"; it doesn't "learn a concept".** It memorizes one unrelated vector for each of 256 positions, with no enforced relationship between position 5 and 6 — so position 257 has no entry and can only be clamped. A formula "derives": any position is computable on the fly, adjacent positions' signals are structurally linked, and it comes with the "relative distance enters the inner product" property for free. **Memorizing entries can never extrapolate; learning a concept can.**
 
-**反证**：如果固定公式没用甚至有害，训练会自动把它抵消——旋转作用在 q、k 上，而 q_proj、k_proj 是学出来的，网络完全可以投影到"旋转影响很小"的子空间。它没有这么做；所有现代 LLM 都依赖 RoPE，说明训练数据验证了这个先验值得利用。
+**Proof by contradiction**: if the fixed formula were useless or harmful, training would automatically cancel it out — rotation acts on q and k, while q_proj and k_proj are learned, so the network could project into a subspace where rotation barely matters. It doesn't; all modern LLMs depend on RoPE, which shows the training data validated this prior as worth exploiting.
 
-| | 可学习位置表（embed_positions） | 固定公式（RoPE） |
+| | Learnable table (embed_positions) | Fixed formula (RoPE) |
 |---|---|---|
-| 信息形态 | 逐条目记忆（字典） | 结构性计算（公式） |
-| 谁从数据学 | 表格本身（背下每个位置的向量） | 下游网络（学习解读旋转角度） |
-| 位置之间的关系 | 无强制关系，靠数据自己长 | 相邻位置的信号结构相连 |
-| 超出训练长度 | 没有条目，clamp 或失效 | 任意位置可算，可外推 |
+| Form of information | entry-by-entry memorization (a dictionary) | structural computation (a formula) |
+| Who learns from data | the table itself (memorizing each position's vector) | the downstream network (learning to interpret rotation angles) |
+| Relations between positions | none enforced; grown from data | adjacent positions' signals are structurally linked |
+| Beyond trained length | no entry; clamp or fail | any position computable; extrapolates |
 
-## 二、直觉：二维旋转
+## 2. Intuition: rotation in 2-D
 
-先看最简单的二维情况。平面上一个向量 (x, y)，把它**绕原点逆时针旋转角度 θ**，新坐标是（这是高中解析几何的旋转公式）：
+Start with the simplest case. For a plane vector (x, y), **rotate it counterclockwise about the origin by angle θ**; the new coordinates are (high-school analytic geometry):
 
 ```
 x' = x·cos(θ) − y·sin(θ)
 y' = x·sin(θ) + y·cos(θ)
 ```
 
-关键性质：**旋转不改变向量长度**（只改变方向），所以不会破坏数值稳定性。而且旋转是可逆的、光滑的——正是把位置信息加进向量的好方式。
+Key property: **rotation doesn't change a vector's length** (only its direction), so it doesn't destabilize the numbers. And rotation is invertible and smooth — exactly the right way to inject position into a vector.
 
-现在让**旋转角度与位置成正比**：位置 m 的词旋转 `m × ω`（ω 是某个"角速度"）。
+Now make **the rotation angle proportional to position**: the word at position m is rotated by `m × ω` (ω is some "angular velocity").
 
-两个位置分别为 m 和 n 的词，旋转后做点积，数学上可以推出：点积结果 = 原本的点积 × cos((m−n)ω) + 一个相关项。**相对距离 (m−n) 直接出现在内积公式里**——模型通过"两个向量的点积有多大"就能感知它们的距离，不需要任何显式查表。这就是 RoPE 的核心。
+For two words at positions m and n, after rotation their dot product can be shown mathematically to equal: the original dot product × cos((m−n)ω) + a related term. **The relative distance (m−n) appears directly in the inner-product formula** — the model can sense how far apart two words are from "how big their dot product is", with no explicit table lookup. That is the core of RoPE.
 
-> 数学细节（可跳过）：旋转矩阵 `R(θ)` 满足 `R(mω)·R(nω)ᵀ = R((m−n)ω)`——旋转矩阵的乘积只依赖角度差。q·Rᵀ 与 k·Rᵀ 的内积 = q·R((m−n)ω)·kᵀ，相对位置进内积。
+> Math detail (skippable): the rotation matrix `R(θ)` satisfies `R(mω)·R(nω)ᵀ = R((m−n)ω)` — the product of rotation matrices depends only on the angle difference. The inner product of q·Rᵀ and k·Rᵀ = q·R((m−n)ω)·kᵀ: relative position enters the inner product.
 
-## 三、高维推广：多组独立旋转 + 频率递减
+## 3. Generalizing to high dimensions: many independent rotations + decreasing frequencies
 
-256 维向量没法整体"绕一个轴转"（那是三维才有的直觉）。RoPE 的做法是**两两分组**：把 256 维拆成 128 对（(x0,x1), (x2,x3), (x4,x5), ...），每对独立做二维旋转：
+A 256-dim vector can't "rotate about one axis" as a whole (that intuition only exists in 3-D). RoPE's approach is **pairing**: split 256 dims into 128 pairs ((x0,x1), (x2,x3), (x4,x5), ...), each pair rotated independently in 2-D:
 
 ```
-第 j 对：角度 = pos × freq[j]
+Pair j: angle = pos × freq[j]
 freq[j] = rope_base ^ (−2j / head_dim) = 10000^(−2j/64)
 ```
 
-**freq（频率）随 j 递减**：
+**freq (frequency) decreases as j grows**:
 
-| j | freq = 10000^(−2j/64) | 角色 |
+| j | freq = 10000^(−2j/64) | Role |
 |---|---|---|
-| 0 | 1.0000 | 转得最快：位置每 +1 转 1 弧度（负责精细的局部信息） |
-| 1 | ≈ 0.750 | 逐渐变慢 |
+| 0 | 1.0000 | rotates fastest: 1 radian per +1 position (fine-grained local information) |
+| 1 | ≈ 0.750 | gradually slower |
 | 2 | ≈ 0.562 | |
 | … | … | |
-| 31 | ≈ 0.00014 | 几乎不转（负责粗糙的长距离信息） |
+| 31 | ≈ 0.00014 | barely rotates (coarse long-range information) |
 
-为什么频率要递减？类比数字的表示：低位变化快（个位），高位变化慢（十位）。**低维对（低 j）承载"精细"的局部位置信息，高维对（高 j）承载"粗糙"的长距离信息**。不同频率的组合让向量能同时区分"相邻位置"和"远距离位置"。
+Why decreasing frequencies? Analogy to numbers: the low digits change fast (the ones place), the high digits change slowly (the tens place). **Low-dim pairs (low j) carry "fine" local position information; high-dim pairs (high j) carry "coarse" long-range information**. The combination of frequencies lets one vector distinguish both "adjacent positions" and "distant positions".
 
-## 四、GPT-NeoX 交错排列（interleaved）
+## 4. GPT-NeoX interleaved pairing
 
-分组有两种常见排法：
+Two common ways to pair:
 
-- **相邻排列（adjacent）**（原版 RoPE）：前半向量和后半向量配对——(x0, x32), (x1, x33), ...
-- **交错排列**（GPT-NeoX 风格，**我们用的**）：直接相邻配对——(x0, x1), (x2, x3), (x4, x5), ...
+- **Adjacent pairing** (original RoPE): the first half of the vector pairs with the second half — (x0, x32), (x1, x33), ...
+- **Interleaved pairing** (GPT-NeoX style, **what we use**): immediate neighbors pair — (x0, x1), (x2, x3), (x4, x5), ...
 
-| | 相邻排列（原版 RoPE） | 交错排列（GPT-NeoX，我们） |
+| | Adjacent (original RoPE) | Interleaved (GPT-NeoX, ours) |
 |---|---|---|
-| 配对方式 | (x0, x32), (x1, x33), … | (x0, x1), (x2, x3), … |
-| 读取模式 | 跨半读取 | 连续读两个元素 |
-| 代码复杂度 | 稍高 | 更低 |
-| 使用者 | 原版论文 | LLaMA / Gemma |
+| Pairing | (x0, x32), (x1, x33), … | (x0, x1), (x2, x3), … |
+| Read pattern | reads across halves | reads two contiguous elements |
+| Code complexity | slightly higher | lower |
+| Used by | the original paper | LLaMA / Gemma |
 
-交错排列的代码更简单（连续读取两个元素就行），LLaMA、Gemma 都用它。我们的实现（`src/ops.cpp`）：
+Interleaved pairing is simpler to code (just read two contiguous elements), and both LLaMA and Gemma use it. Our implementation (`src/ops.cpp`):
 
 ```cpp
 void RopeCache::apply(float* x, uint32_t pos) const {
@@ -111,132 +111,132 @@ void RopeCache::apply(float* x, uint32_t pos) const {
     const float* s = sin_t.data() + (size_t)pos * nhalf;
     for (uint32_t j = 0; j < nhalf; j++) {
         float x0 = x[2 * j], x1 = x[2 * j + 1];
-        x[2 * j]     = x0 * c[j] - x1 * s[j];    // 旋转公式
+        x[2 * j]     = x0 * c[j] - x1 * s[j];    // rotation formula
         x[2 * j + 1] = x0 * s[j] + x1 * c[j];
     }
 }
 ```
 
-**注意 `x0`、`x1` 是局部变量的拷贝**——这行看似多余，实际是深刻的教训（见第七节）。
+**Note that `x0` and `x1` are local copies** — that seemingly redundant line is a deep lesson (see Section 7).
 
-## 五、cos/sin 表：为什么"惰性生成（lazy）"？
+## 5. The cos/sin tables: why "lazy generation"?
 
-每对旋转需要 cos 和 sin。如果像朴素的实现那样，启动时把 `128K 位置 × 192 对 × 2 × 4 字节 ≈ 393MB` 全部预计算，那引擎还没开始推理就先占用近 400MB——而我们整个量化模型才 900MB。
+Each pair's rotation needs cos and sin. A naive implementation precomputes at startup: `128K positions × 192 pairs × 2 × 4 bytes ≈ 393 MB` — the engine would occupy nearly 400 MB before inference even starts, while our entire quantized model is only 900 MB.
 
-观察：**实际推理时只用到"已经到达过的位置"**。生成第 70 个 token 时，只需要位置 0~70 的表。所以 `ensure(pos)` 惰性扩展：
+Observation: **inference only ever touches positions it has actually reached**. Generating the 70th token only needs the table for positions 0–70. So `ensure(pos)` extends lazily:
 
 ```cpp
 void RopeCache::ensure(uint32_t pos) {
-    if (pos < max_pos) return;                    // 已经生成过了
+    if (pos < max_pos) return;                    // already generated
     const uint32_t new_rows = pos + 1;
-    cos_t.resize((size_t)new_rows * nhalf);       // 扩容
+    cos_t.resize((size_t)new_rows * nhalf);       // grow
     sin_t.resize((size_t)new_rows * nhalf);
-    // 只计算 [max_pos, new_rows) 这一小段新行
+    // compute only the small new range [max_pos, new_rows)
     for (uint32_t p = max_pos; p < new_rows; p++) { ... }
     max_pos = new_rows;
 }
 ```
 
-频率 `freq[j]` 只需 32 个数，预计算一次。cos/sin 每行 32 对，用到才生成。**内存与"实际生成长度"成正比，而不是与"理论上限"成正比**——引擎里同样的哲学出现在 KV Cache（07篇）和 embed_positions 上。
+The frequencies `freq[j]` are only 32 numbers, precomputed once. cos/sin are 32 pairs per row, generated only when needed. **Memory scales with the length actually generated, not with the theoretical cap** — the same philosophy appears in the KV cache (Chapter 07) and embed_positions.
 
-## 六、RoPE 用在哪：注意力里的 q 和 k
+## 6. Where RoPE is applied: attention's q and k
 
-RoPE 只施加在注意力的 **q 和 k** 上，不碰 v（06篇讲它们分别是什么）。直觉：q 和 k 做点积决定"谁看谁"，位置信息要影响这个点积；v 是注意力要取用的内容，内容本身不需要位置调制。
+RoPE is applied only to attention's **q and k**, never to v (Chapter 06 explains what each is). Intuition: q and k take the dot product that decides "who looks at whom", so position must influence that dot product; v is the content attention retrieves, and content itself doesn't need position modulation.
 
-注意这和位置表（03篇）是两种完全不同的加入方式：`embed_positions` 是**加法**——在输入端把位置向量加到 token 向量上（`hidden = embed_tokens[tok] + embed_positions[pos]`），位移是固定查表的、与 token 无关；RoPE 是**旋转**——输入向量从头到尾不动，被旋转的是投影后的 q/k，位置藏在旋转角度里，任何位置都能算。一句话：位置表是"每个位置一个位移"，RoPE 是"每个位置一个旋转角"。
+Note this is a completely different mechanism from the position table (Chapter 03): `embed_positions` is **addition** — at the input, a position vector is added to the token vector (`hidden = embed_tokens[tok] + embed_positions[pos]`); the shift is a fixed table lookup, independent of the token. RoPE is **rotation** — the input vectors are never touched; what gets rotated are the projected q/k, the position hides in the rotation angle, and any position is computable. In one sentence: the position table is "one shift per position"; RoPE is "one rotation angle per position".
 
-两种机制并排看：
+The two mechanisms side by side:
 
 ```
-位置表（加法）：位置信息写在向量值里，跟着向量传递
-  token → 查表 → 加位置向量 → hidden（已带位置）→ 第 1 层 → 第 2 层 → ……
-  每一层都看到被位移过的向量
+Position table (addition): position info lives in the vector values, travels with the vector
+  token → lookup → add position vector → hidden (already positioned) → layer 1 → layer 2 → ……
+  every layer sees the shifted vector
 
-RoPE（旋转）：位置信息不在向量里，在"点积"这个运算里
-  hidden → q_proj → 旋转 → q' ─┐
-                               ├→ 点积：score_t = q'·k'_t ← 位置只在这里显现
-  hidden → k_proj → 旋转 → k' ─┘   k' 写入缓存，未来每步的点积读它
-  → softmax → 加权和 Σ p·v → 注意力输出（带位置）→ o_proj → 下一层
+RoPE (rotation): position info is not in the vector; it's in the "dot product" operation
+  hidden → q_proj → rotate → q' ─┐
+                                 ├→ dot product: score_t = q'·k'_t ← position only shows up here
+  hidden → k_proj → rotate → k' ─┘   k' is written to the cache; every future step's dot product reads it
+  → softmax → weighted sum Σ p·v → attention output (positioned) → o_proj → next layer
 ```
 
-`src/model.cpp` 的 `attention_block`：
+`attention_block` in `src/model.cpp`:
 
 ```cpp
-gemv_i8_f32(L.q, x, q_buf);   // 算出 q
-gemv_i8_f32(L.k, x, k_buf);   // 算出 k
+gemv_i8_f32(L.q, x, q_buf);   // compute q
+gemv_i8_f32(L.k, x, k_buf);   // compute k
 ...
-for (uint32_t h = 0; h < nh; h++) rope.apply(q_buf + h*hd, pos);  // q 旋转
-for (uint32_t h = 0; h < nkv; h++) rope.apply(k_buf + h*hd, pos); // k 旋转
-kv.write(pos, k_buf, v_buf);  // 旋转后的 k 写入缓存（07篇的关键约定）
+for (uint32_t h = 0; h < nh; h++) rope.apply(q_buf + h*hd, pos);  // rotate q
+for (uint32_t h = 0; h < nkv; h++) rope.apply(k_buf + h*hd, pos); // rotate k
+kv.write(pos, k_buf, v_buf);  // the rotated k goes into the cache (the key convention of Chapter 07)
 ```
 
 ```mermaid
 flowchart LR
-    X["归一化后的 x"] --> A["q = q_proj @ x<br/>（4 头 × 64 维）"] --> RQ["RoPE 旋转"] --> D["点积算分数：q'·k'_t<br/>（06篇）——算完即弃，不进缓存"]
-    X --> B["k = k_proj @ x<br/>（1 头 × 64 维）"] --> RK["RoPE 旋转"] --> W["kv.write：写入 KV Cache"]
+    X["normalized x"] --> A["q = q_proj @ x<br/>(4 heads × 64 dims)"] --> RQ["RoPE rotation"] --> D["dot product scores: q'·k'_t<br/>(Chapter 06) — discarded after use, never cached"]
+    X --> B["k = k_proj @ x<br/>(1 head × 64 dims)"] --> RK["RoPE rotation"] --> W["kv.write: into the KV cache"]
     X --> C["v = v_proj @ x"] --> W
-    W -->|"未来每步读历史 k'"| D
-    W --> N["注意：写进缓存的 k 是已旋转的<br/>每个历史位置只旋转一次"]
+    W -->|"every future step reads historical k'"| D
+    W --> N["note: the k written to the cache is already rotated<br/>each historical position is rotated exactly once"]
 ```
 
-旋转后的 q、k **不再进入任何后续网络层**：q' 当场和每个历史位置的 k' 做点积算分数，全部点积算完，q' 用完即弃——**分数本身不扔**，随即进 softmax 变概率、对 v 加权求和，得到注意力输出（详见《06-注意力》）；k' 写入缓存，供未来每一步的点积直接读取。
+The rotated q and k **enter no further layers**: q' immediately takes dot products with every historical position's k' to score them; once all the dot products are done, q' is discarded — **the scores themselves are not thrown away**, they immediately go into softmax to become probabilities and weight-sum v into the attention output (see [06 - Attention](06-Attention.md)); k' is written to the cache for every future step's dot product to read directly.
 
-分数的旅程（以位置 2 为例，历史位置 0、1、2）：
+The journey of a score (example: position 2, with history positions 0, 1, 2):
 
 ```
-① 算分数   score₀ = q'·k'₀   score₁ = q'·k'₁   score₂ = q'·k'₂
-② softmax  p₀ p₁ p₂（和为 1）—— 分数在这里变成概率
-③ 加权和   attn_out = p₀·v₀ + p₁·v₁ + p₂·v₂  ← 分数在这条式子里被真正使用
-④ 继续走   attn_out → o_proj → hidden += attn_out → 下一层
+① Scores    score₀ = q'·k'₀   score₁ = q'·k'₁   score₂ = q'·k'₂
+② Softmax   p₀ p₁ p₂ (sum to 1) — scores become probabilities here
+③ Weighted  attn_out = p₀·v₀ + p₁·v₁ + p₂·v₂  ← the scores are truly used in this expression
+④ Onward    attn_out → o_proj → hidden += attn_out → next layer
 ```
 
-那到底谁扔、谁留：
+So who is discarded and who is kept:
 
-| 谁 | 下场 |
+| What | Fate |
 |---|---|
-| q' | **扔**：只用一次，未来位置的注意力读的是自己的 qₘ（m > n），从不读历史 q |
-| k' | **存**：未来每一步都要和新的 q' 点积，所以进 KV Cache |
-| 原始分数 | 被覆盖：softmax 原地算出概率后它就用完了（06篇思考题2） |
-| 概率 p | 被吸收：加权和算完即结束 |
-| 注意力输出 | **继续走**：唯一进入下一层的东西 |
+| q' | **Discarded**: used once; a future position's attention reads its own qₘ (m > n), never historical q |
+| k' | **Kept**: every future step dot-products against it, so it goes into the KV cache |
+| Raw scores | Overwritten: once softmax computes probabilities in place, they're spent (Exercise 2 of Chapter 06) |
+| Probabilities p | Absorbed: gone once the weighted sum is computed |
+| Attention output | **Continues onward**: the only thing that enters the next layer |
 
-真正带着位置信息继续往下传递的是**注意力输出**——它是用这些"带位置的分数"对 v 加权求和拼出来的。对比位置表：位置信息写在向量值里，跟着向量传递到每一层；RoPE 的位置信息不在向量值里，而在点积这个运算里——q'、k' 单独拿出来，位置只体现在方向中，一相乘，相对距离就显现。
+What actually carries position information into the deeper layers is the **attention output** — it is assembled by weight-summing v with these "positioned scores". Contrast with the position table: there, position lives in the vector values and travels with them into every layer; in RoPE, position lives in the dot-product operation — take q' or k' alone and position shows up only as direction; multiply, and the relative distance appears.
 
-**约定：写进 KV Cache 的 k 是已经旋转过的。** 这样解码时读历史 k 就不用再旋转（每个历史位置只旋转一次）。NumPy 参考实现必须采用同一约定，否则测试全红——这是我们单测里专门验证的一条（`attention_scores_kv` 测试）。
+**The convention: the k written to the KV cache is already rotated.** That way, decoding never re-rotates historical k (each historical position is rotated exactly once). The NumPy reference must follow the same convention or every test goes red — one of our unit tests verifies exactly this (the `attention_scores_kv` test).
 
-## 七、我们踩过的真实 bug：原地别名（in-place aliasing）
+## 7. A real bug we hit: in-place aliasing
 
-第一版 Python 参考实现长这样（`py/reference_model.py` 的 `rope_apply`）：
+The first version of the Python reference looked like this (`rope_apply` in `py/reference_model.py`):
 
 ```python
-x0, x1 = x[..., 0::2], x[..., 1::2]   # ← 注意：这是"视图"，不是拷贝！
+x0, x1 = x[..., 0::2], x[..., 1::2]   # ← note: these are "views", not copies!
 x[..., 0::2] = x0 * c - x1 * s
-x[..., 1::2] = x0 * s + x1 * c       # ← 此时 x0 已经指向被改过的偶数位！
+x[..., 1::2] = x0 * s + x1 * c       # ← by now x0 points at the already-modified even slots!
 ```
 
-`x0` 是 x 的**视图**（view），不是拷贝。第一行把偶数位写成了旋转后的值；第二行读 `x0`（偶数位）时读到的已经是**新值**，用它去算奇数位——公式就错了。这个 bug 让所有涉及注意力的 golden 测试全红，而且错得"有规律"（差值随维度递减，因为高维对的角度小、污染小），排查时才意识到是经典的原位依赖问题。
+`x0` is a **view** of x, not a copy. The first line writes the rotated values into the even slots; the second line reads `x0` (the even slots) and gets the **new** values, then uses them to compute the odd slots — the formula is wrong. This bug turned every attention-related golden test red, and the error had a "pattern" (deviation decreasing with dimension, because high-dim pairs have small angles and little contamination) — which is what eventually revealed the classic in-place dependency problem.
 
-修复就是加 `.copy()`：
+The fix is adding `.copy()`:
 
 ```python
 x0, x1 = x[..., 0::2].copy(), x[..., 1::2].copy()
 ```
 
-C++ 版因为用了局部变量 `float x0, x1` 天然免疫——**写 C++ 时的局部变量写法，恰好就是正确做法**。
+The C++ version is naturally immune because of the local variables `float x0, x1` — **the way you instinctively write C++ locals happens to be the correct approach**.
 
-**教训**：凡是对数组"先读旧值、再写新值"的原地操作，必须确认读和写之间的依赖关系。这类 bug 单测能抓住（golden 对照），但前提是你有单测。
+**Lesson**: for any in-place operation that "reads old values, then writes new values", verify the read/write dependency. Unit tests catch this class of bug (golden comparison) — but only if you have them.
 
-## 八、总结
+## 8. Summary
 
-1. RoPE = 把位置编码成"旋转"，相对距离 (p−q) 直接进入 q·k 内积
-2. 实现：两两配对做二维旋转，频率 `10000^(-2j/d)` 随 j 递减（精细↔粗糙）
-3. 我们用 GPT-NeoX 交错排列：(x0,x1), (x2,x3)...
-4. cos/sin 表按到达过的位置惰性生成，内存与生成长度成正比
-5. RoPE 只施加于 q 和 k；**写入 KV Cache 的 k 是已旋转的**（与 NumPy 参考完全一致）
-6. 原地旋转必须先拷贝配对元素（Python 视图污染的真 bug）；C++ 局部变量天然正确
+1. RoPE = encode position as "rotation"; the relative distance (p−q) enters the q·k inner product directly
+2. Implementation: rotate pairs in 2-D with frequency `10000^(-2j/d)` decreasing in j (fine ↔ coarse)
+3. We use GPT-NeoX interleaved pairing: (x0,x1), (x2,x3)...
+4. cos/sin tables are generated lazily for positions actually reached; memory scales with generated length
+5. RoPE applies only to q and k; **the k written to the KV cache is already rotated** (identical to the NumPy reference)
+6. In-place rotation must copy the pair elements first (the real Python view-contamination bug); C++ locals are naturally correct
 
-## 思考题
+## Exercises
 
-1. 位置 0 的旋转矩阵是什么？为什么位置 0 的 RoPE 是恒等变换（什么都不变）？我们的测试里恰好验证了这一点，找出来。
-2. 为什么 freq 用指数衰减（10000 的幂）而不是线性衰减（比如 1/j）？
-3. `rope.apply` 在 `q_buf` 上原地旋转。q_buf 下一次被 `gemv_i8_f32` 覆写，所以没问题。如果某个调用方想复用旋转前的 q，会怎样？这种"缓冲区生命周期"问题怎么防？（提示：见《12-测试策略》的缓冲区设计）
+1. What is the rotation matrix for position 0? Why is RoPE at position 0 the identity transform (nothing changes)? One of our tests verifies exactly this — find it.
+2. Why does freq decay exponentially (powers of 10000) rather than linearly (say, 1/j)?
+3. `rope.apply` rotates `q_buf` in place. q_buf is overwritten by the next `gemv_i8_f32`, so it's fine. What if some caller wanted to reuse the pre-rotation q? How do you guard against this class of "buffer lifetime" problem? (Hint: see the buffer design in [12 - Testing Strategy](12-Testing-Strategy.md))
